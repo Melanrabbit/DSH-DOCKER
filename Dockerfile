@@ -25,4 +25,4 @@ WORKDIR /workspace
 EXPOSE 3080
 
 # 启动 dsh，通过 --host 0.0.0.0 允许容器外访问
-CMD ["npx", "@deepseek-ai/dsh", "web", "--host", "0.0.0.0"]
+CMD ["dsh", "web", "--host", "0.0.0.0"]
