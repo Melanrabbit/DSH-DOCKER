@@ -52,12 +52,24 @@ RUN BIN="$(node -p "require('/usr/local/lib/node_modules/@deepseek-ai/dsh/packag
 # 安全说明：设置文档即 profile 的 patch 文件，能挂载任意插件（≈ 代码执行），
 # 上游把设置页限制在回环地址就是为了挡住这条路。本镜像的兜底是启动 token +
 # Host/Origin 信任围栏（DSH_TRUSTED_HOSTS），请勿再把端口暴露到公网。
-RUN CLIENT=/usr/local/lib/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js \
- && test -f "$CLIENT" \
- && sed -i 's/ctx\.remote\.\$host\.isLoopback ? "host" : "memory"/"host"/' "$CLIENT" \
- && grep -q 'const persistence = "host";' "$CLIENT" \
- && ! grep -q 'isLoopback ? "host" : "memory"' "$CLIENT" \
- && echo "client-ui-settings: persistence pinned to host (fnOS parity)"
+# 注：路径不能硬编码。`npm install -g` 会把依赖装进包自己的 node_modules
+# （/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/...），而本地
+# 非全局安装是扁平的（.../node_modules/@deepseek-ai/dsh-client-ui-settings），
+# 所以这里用 find 定位；找不到就打印实际位置并让构建失败。
+RUN set -eu; \
+    FOUND=0; \
+    for f in $(find /usr/local/lib/node_modules -path '*/@deepseek-ai/dsh-client-ui-settings/lib/client.js'); do \
+      echo "settings client bundle: $f"; \
+      sed -i 's/ctx\.remote\.\$host\.isLoopback ? "host" : "memory"/"host"/' "$f"; \
+      grep -q 'const persistence = "host";' "$f"; \
+      FOUND=1; \
+    done; \
+    if [ "$FOUND" -ne 1 ]; then \
+      echo "ERROR: 没找到 dsh-client-ui-settings/lib/client.js，实际安装位置如下："; \
+      find /usr/local/lib/node_modules -name 'client.js' -path '*dsh-client-ui-settings*'; \
+      exit 1; \
+    fi; \
+    echo "client-ui-settings: persistence pinned to host (fnOS parity)"
 
 # ── 修复 3：被 CLI 拒绝的 --host 0.0.0.0，以及桥接网络下的 /api 403 ──────
 # dsh 0.2.0-rc.2 会直接拒绝 --host 0.0.0.0（"intentionally not supported yet
