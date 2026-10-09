@@ -98,23 +98,6 @@ RUN mkdir -p /etc/dsh \
  && mkdir -p /home/node/.dsh /workspace \
  && chown -R node:node /home/node/.dsh /workspace
 
-# ── Command Code provider 插件（@mars-sea/dsh-commandcode-provider）────────
-# 用官方命令装进 web profile：它会写 profile 的 package.json（dependencies +
-# 把包注册进 dsh.profile.bundles），并用 pnpm 装到 profile 的 node_modules。
-# 插件自带的 cordis.patch.yml 会插入 llm-commandcode 行，注册 commandcode
-# provider 路由和「设置 → 模型」里的卡片 —— 装完即生效，不需要手写配置。
-#
-# 烤进镜像的目的：让「全新的 DSH_HOME 卷」开箱就带这个插件。
-# ⚠️ 已经存在的卷不会被写入 —— 那种情况要在容器里补装一次（见 README）。
-# HOME 指向临时目录只是给 corepack/pnpm 放缓存，装完删掉，不污染 /workspace。
-RUN DSH_HOME=/home/node/.dsh HOME=/tmp/plugin-build npm_config_registry=https://registry.npmmirror.com \
-      dsh plugin --profile web add @mars-sea/dsh-commandcode-provider@latest \
- && rm -rf /tmp/plugin-build \
- && chown -R node:node /home/node/.dsh \
- && grep -q 'dsh-commandcode-provider' /home/node/.dsh/profiles/web/package.json \
- && test -d /home/node/.dsh/profiles/web/node_modules/@mars-sea/dsh-commandcode-provider \
- && echo "commandcode provider installed into the image profile"
-
 # 设置环境变量
 ENV DSH_HOME=/home/node/.dsh
 ENV HOME=/workspace
