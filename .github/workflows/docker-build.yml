@@ -1,0 +1,33 @@
+name: Auto Build dsh Docker Image
+
+on:
+  schedule:
+    # 每天北京时间凌晨 3 点（UTC 19:00）自动检查并构建
+    - cron: '0 19 * * *'
+  workflow_dispatch: # 允许你在 GitHub 网页上手动点按钮触发
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # 镜像地址格式: ghcr.io/你的GitHub用户名/仓库名:latest
+          tags: ghcr.io/${{ github.repository }}:latest
