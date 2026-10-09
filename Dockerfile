@@ -40,7 +40,26 @@ RUN BIN="$(node -p "require('/usr/local/lib/node_modules/@deepseek-ai/dsh/packag
  && test -f "$(readlink -f /usr/local/bin/dsh)" \
  && echo "dsh entrypoint -> $(readlink -f /usr/local/bin/dsh)"
 
-# ── 修复 2：被 CLI 拒绝的 --host 0.0.0.0，以及桥接网络下的 /api 403 ──────
+# ── 修复 2：设置页在非回环地址下不可用（对齐飞牛 fnOS 打包版的做法）──────
+# 上游设计：设置页的持久化按「浏览器地址栏的主机名」决定 ——
+#   const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
+# 用局域网 IP（例如 http://192.168.110.110:3080）打开时 isLoopback 为 false，
+# 设置页退化成浏览器内存态，报 "settings are unavailable in this browser"，
+# 连读取设置的请求都不发，于是「设置 → 模型」等页面完全不可用。
+# 飞牛的 fnOS 打包版正是把这一行改成常量 "host"（已逐字节对比确认），
+# 所以它的原生实例用局域网 IP 也能进设置页。这里照抄同样的最小改动。
+#
+# 安全说明：设置文档即 profile 的 patch 文件，能挂载任意插件（≈ 代码执行），
+# 上游把设置页限制在回环地址就是为了挡住这条路。本镜像的兜底是启动 token +
+# Host/Origin 信任围栏（DSH_TRUSTED_HOSTS），请勿再把端口暴露到公网。
+RUN CLIENT=/usr/local/lib/node_modules/@deepseek-ai/dsh-client-ui-settings/lib/client.js \
+ && test -f "$CLIENT" \
+ && sed -i 's/ctx\.remote\.\$host\.isLoopback ? "host" : "memory"/"host"/' "$CLIENT" \
+ && grep -q 'const persistence = "host";' "$CLIENT" \
+ && ! grep -q 'isLoopback ? "host" : "memory"' "$CLIENT" \
+ && echo "client-ui-settings: persistence pinned to host (fnOS parity)"
+
+# ── 修复 3：被 CLI 拒绝的 --host 0.0.0.0，以及桥接网络下的 /api 403 ──────
 # dsh 0.2.0-rc.2 会直接拒绝 --host 0.0.0.0（"intentionally not supported yet
 # for safety"）并以退出码 1 退出。绑定地址改由 patch 层提供：webserver 行的
 # schema 允许 "127.0.0.1" / "0.0.0.0" 两个字面量。
