@@ -103,6 +103,40 @@ RUN mkdir -p /etc/dsh \
  && mkdir -p /home/node/.dsh /workspace \
  && chown -R node:node /home/node/.dsh /workspace
 
+# ── 修复 4：明文 http 下 crypto.randomUUID 缺失，导致设置页白屏 ──────────────
+# crypto.randomUUID 只在「安全上下文」（https / localhost / 127.0.0.1）存在。
+# 用 http://<局域网IP>:3080 访问时它不存在，「设置 → 账户」卡片一渲染就抛
+#   TypeError: crypto.randomUUID is not a function
+# 整个设置面板随之崩成白屏（浏览器控制台会看到 slot entry crashed in 'settings.section'）。
+# 飞牛的 fnOS 打包版正是往 index.html 注入了一段同样的兼容代码（已对比确认），
+# 所以原生实例用局域网 IP 访问设置页也正常。这里照抄同样的做法，区别是：
+# 优先用 crypto.getRandomValues 生成真正的 v4 UUID，拿不到才退回 Math.random。
+# 注：navigator.clipboard 同样只在安全上下文存在，所以复制按钮在明文 http 下
+#     仍可能无效；要完全干净就用 https 反代，或 SSH 隧道从 127.0.0.1 访问。
+RUN set -eu; \
+    HTML="$(find /usr/local/lib/node_modules -path '*dsh-web-frontend/dist/index.html' -print -quit)"; \
+    if [ -z "$HTML" ]; then echo "ERROR: 没找到 dsh-web-frontend/dist/index.html"; exit 1; fi; \
+    DIST="$(dirname "$HTML")"; \
+    printf '%s\n' \
+      '(function () {' \
+      '  if (!window.crypto) window.crypto = {};' \
+      '  if (crypto.randomUUID) return;' \
+      '  crypto.randomUUID = function () {' \
+      '    var b = new Uint8Array(16);' \
+      '    if (crypto.getRandomValues) crypto.getRandomValues(b);' \
+      '    else for (var i = 0; i < 16; i++) b[i] = (Math.random() * 256) | 0;' \
+      '    b[6] = (b[6] & 15) | 64;' \
+      '    b[8] = (b[8] & 63) | 128;' \
+      '    var h = [];' \
+      '    for (var j = 0; j < 16; j++) h.push((b[j] + 256).toString(16).slice(1));' \
+      '    return h.slice(0, 4).join("") + "-" + h.slice(4, 6).join("") + "-" + h.slice(6, 8).join("") + "-" + h.slice(8, 10).join("") + "-" + h.slice(10, 16).join("");' \
+      '  };' \
+      '})();' > "$DIST/dsh-secure-context-shim.js"; \
+    grep -q 'dsh-secure-context-shim' "$HTML" || sed -i 's#<head>#<head><script src="./dsh-secure-context-shim.js"></script>#' "$HTML"; \
+    grep -q 'dsh-secure-context-shim' "$HTML"; \
+    grep -q 'crypto.randomUUID = function' "$DIST/dsh-secure-context-shim.js"; \
+    echo "index.html patched: crypto.randomUUID shim injected"
+
 # ── 运行时需要 pnpm ───────────────────────────────────────────────────────
 # dsh 自己不引导 pnpm：`dsh plugin` 只是把参数转发给 pnpm（缺了会提示
 # "pnpm was not found"），GUI 的「设置 → 插件 → 添加插件」更是直接 spawn pnpm
