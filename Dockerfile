@@ -22,8 +22,13 @@ RUN npm install --global --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi
 # 使用精简版镜像，减小最终体积
 FROM node:24-trixie-slim
 
-# 安装运行时需要的少量工具
-RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+# 安装运行时需要的工具（面向 coding agent 的常用命令）
+# 注意：不需要装系统 ripgrep —— dsh 的搜索工具用的是 npm 包里自带的 rg
+# （@vscode/ripgrep + 平台专属包，二进制直接打在 tarball 里，不依赖 postinstall）。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl ca-certificates \
+      jq less unzip zip file xz-utils procps rsync openssh-client \
+ && rm -rf /var/lib/apt/lists/*
 
 # 从构建阶段复制编译好的全局 node_modules
 COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
@@ -106,6 +111,23 @@ RUN mkdir -p /etc/dsh \
 RUN npm config set registry https://registry.npmmirror.com \
  && npm install -g pnpm@10 \
  && pnpm --version
+
+# ── 环境收尾 ──────────────────────────────────────────────────────────────
+# 1) git 安全检查：宿主机挂进来的目录通常属于别的 uid（NAS 上常见 1001），容器内是
+#    1000，git 会以 "detected dubious ownership" 直接拒绝工作 —— 而 dsh 的「本轮
+#    改动文件」卡片正是靠 git 快照实现的。写到 system 级（/etc/gitconfig）：因为
+#    HOME=/workspace，写到 global 级会落进工作区里。
+# 2) 缓存与运行时目录：HOME=/workspace，不重定向的话 npm/pnpm 会把 .npm/.cache/
+#    .local 写进工作区（污染工作区；工作区只读时插件安装会直接失败）。
+#    缓存放 DSH_HOME（在卷里，重建不丢），XDG 放 /tmp。与社区镜像的做法一致。
+# 3) LANG：不设的话 shell 工具在 C locale 下会把中文文件名/内容输出成八进制转义。
+RUN git config --system --add safe.directory '*' \
+ && git config --system --get-all safe.directory
+ENV NPM_CONFIG_CACHE=/home/node/.dsh/npm-cache
+ENV XDG_CACHE_HOME=/tmp/.cache
+ENV XDG_CONFIG_HOME=/tmp/.config
+ENV XDG_DATA_HOME=/tmp/.local/share
+ENV LANG=C.UTF-8
 
 # 设置环境变量
 ENV DSH_HOME=/home/node/.dsh
