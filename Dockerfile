@@ -98,6 +98,15 @@ RUN mkdir -p /etc/dsh \
  && mkdir -p /home/node/.dsh /workspace \
  && chown -R node:node /home/node/.dsh /workspace
 
+# ── 运行时需要 pnpm ───────────────────────────────────────────────────────
+# dsh 自己不引导 pnpm：`dsh plugin` 只是把参数转发给 pnpm（缺了会提示
+# "pnpm was not found"），GUI 的「设置 → 插件 → 添加插件」更是直接 spawn pnpm
+# （缺了报 spawn pnpm ENOENT）。node 官方镜像只带 yarn 的 corepack shim，不含 pnpm。
+# 顺带把 npm registry 指到国内镜像，让插件安装更快更稳；不需要就删掉第一行。
+RUN npm config set registry https://registry.npmmirror.com \
+ && npm install -g pnpm@10 \
+ && pnpm --version
+
 # 设置环境变量
 ENV DSH_HOME=/home/node/.dsh
 ENV HOME=/workspace
