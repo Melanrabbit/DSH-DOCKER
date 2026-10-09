@@ -1,36 +1,39 @@
-# ===== 第一阶段：构建阶段 =====
-FROM node:22-bookworm AS builder
+# 使用官方的 Node.js 24 镜像（非 slim 版，自带编译工具链）
+FROM node:24-trixie
 
 # 设置 npm 国内镜像源
 RUN npm config set registry https://registry.npmmirror.com
-
-ARG DSH_VERSION=latest
-
-# 全局安装官方 dsh，npm 会自动编译原生模块
-RUN npm install -g @deepseek-ai/dsh@${DSH_VERSION}
-
-# ===== 第二阶段：运行阶段 =====
-FROM node:22-bookworm-slim
-
-# 安装运行时需要的少量工具
-RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
-
-# 从构建阶段复制编译好的全局 node_modules
-COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
-
-# 手动创建 dsh 启动脚本，直接从包入口加载
-RUN printf '#!/bin/sh\nexec node /usr/local/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js "$@"\n' > /usr/local/bin/dsh && chmod +x /usr/local/bin/dsh
 
 # 设置环境变量
 ENV DSH_HOME=/home/node/.dsh
 ENV HOME=/workspace
 ENV TZ=Asia/Shanghai
 
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    python3 \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 接收版本号参数
+ARG DSH_VERSION=latest
+
+# 核心步骤：使用 npm 完整安装 dsh，并允许编译原生模块
+RUN npm install --global --omit=dev --no-audit --no-fund \
+    --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs \
+    "@deepseek-ai/dsh@${DSH_VERSION}"
+
 # 创建数据和挂载目录
 RUN mkdir -p /home/node/.dsh /workspace && chown -R node:node /home/node/.dsh /workspace
 
+# 切换到非 root 用户
 USER node
 WORKDIR /workspace
+
+# 暴露端口
 EXPOSE 3080
 
+# 启动 dsh，监听所有网卡
 CMD ["dsh", "web", "--host", "0.0.0.0"]
