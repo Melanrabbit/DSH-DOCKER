@@ -1,3 +1,10 @@
+name: Auto Build dsh Docker Image
+
+on:
+  schedule:
+    - cron: '0 19 * * *' # 每天凌晨 3 点自动检查更新
+  workflow_dispatch:      # 允许手动触发
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -9,10 +16,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 新增步骤：获取官方最新版本号
       - name: Get latest dsh version from npm
         id: dsh_version
         run: |
+          npm config set registry https://registry.npmmirror.com
           VERSION=$(npm view @deepseek-ai/dsh version)
           echo "DSH_VERSION=$VERSION" >> $GITHUB_ENV
           echo "Latest dsh version is $VERSION"
@@ -36,6 +43,5 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_NAME }}:latest
             ghcr.io/${{ env.IMAGE_NAME }}:${{ env.DSH_VERSION }}
-          # 将版本号传递给 Dockerfile
           build-args: |
             DSH_VERSION=${{ env.DSH_VERSION }}
