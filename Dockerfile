@@ -1,0 +1,84 @@
+# ============================================================
+#  dsh Docker 镜像（修正版）
+#  基于 Melanrabbit/DSH-DOCKER 原 Dockerfile，修掉两个必崩的 bug，
+#  并解决「桥接网络下界面 403」的问题。详细说明见 README.md。
+# ============================================================
+
+# ===== 第一阶段：构建阶段 =====
+# 使用完整的 Node.js 24 镜像，自带编译工具链
+FROM node:24-trixie AS builder
+
+# 设置 npm 国内镜像源，加速依赖下载
+RUN npm config set registry https://registry.npmmirror.com
+
+# 接收版本号参数
+ARG DSH_VERSION=latest
+
+# 安装官方 dsh，并显式允许必要的安装脚本执行
+# （这 5 个就是依赖树里全部带 install/postinstall 脚本的包，且都含原生模块，别删）
+RUN npm install --global --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs "@deepseek-ai/dsh@${DSH_VERSION}"
+
+# ===== 第二阶段：运行阶段 =====
+# 使用精简版镜像，减小最终体积
+FROM node:24-trixie-slim
+
+# 安装运行时需要的少量工具
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# 从构建阶段复制编译好的全局 node_modules
+COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+
+# ── 修复 1：断链的 dsh 命令 ────────────────────────────────────────────
+# 原写法 `ln -sf .../dsh/bin/dsh.js` 指向不存在的文件：该 npm 包里没有
+# bin/ 目录，真实入口是 lib/bin.js。悬空软链会让 node 基础镜像的
+# docker-entrypoint.sh 判定「dsh 不是可执行命令」，把命令改写成
+# `node dsh web ...`，随即以 `Cannot find module '/workspace/dsh'` 退出。
+# 这里从 package.json 的 bin 字段读取真实路径，并在构建期校验软链能解析到
+# 真实文件 —— 以后再变包结构会「构建失败」，而不是静默变成重启循环。
+RUN BIN="$(node -p "require('/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json').bin.dsh")" \
+ && ln -sf "/usr/local/lib/node_modules/@deepseek-ai/dsh/${BIN}" /usr/local/bin/dsh \
+ && test -f "$(readlink -f /usr/local/bin/dsh)" \
+ && echo "dsh entrypoint -> $(readlink -f /usr/local/bin/dsh)"
+
+# ── 修复 2：被 CLI 拒绝的 --host 0.0.0.0，以及桥接网络下的 /api 403 ──────
+# dsh 0.2.0-rc.2 会直接拒绝 --host 0.0.0.0（"intentionally not supported yet
+# for safety"）并以退出码 1 退出。绑定地址改由 patch 层提供：webserver 行的
+# schema 允许 "127.0.0.1" / "0.0.0.0" 两个字面量。
+#
+# 放在 /etc/dsh（而不是 $DSH_HOME）是为了不被挂载卷遮住。
+# 另外补一条 connection 行：把环境变量 DSH_TRUSTED_HOSTS 里的地址追加进
+# 可信 Host 列表 —— 用桥接网络 + 端口映射时，容器看到的网卡 IP 是 172.x，
+# 宿主机 IP 不在自动派生出来的列表里，不加这个所有 /api 都会 403。
+#
+#   DSH_PORT           监听端口，默认 3080
+#   DSH_TRUSTED_HOSTS  额外可信地址，逗号分隔；用 host 网络时不需要
+RUN mkdir -p /etc/dsh \
+ && printf '%s\n' \
+      '# 绑定所有网卡，等价于原来的 --host 0.0.0.0，但走官方支持的配置层' \
+      '- id: webserver' \
+      '  config:' \
+      "    host: '0.0.0.0'" \
+      '    port: !!js Number(process.env.DSH_PORT ?? 3080)' \
+      '# 桥接网络部署时，把 DSH_TRUSTED_HOSTS 里声明的地址也加入可信 Host' \
+      '- id: connection' \
+      '  config:' \
+      "    trustedHosts: !!js (process.env.DSH_TRUSTED_HOSTS ?? '').split(',').map((s) => s.trim()).filter(Boolean).concat(ctx.webRuntime.trustedHosts)" \
+      > /etc/dsh/webserver.patch.yml \
+ && mkdir -p /home/node/.dsh /workspace \
+ && chown -R node:node /home/node/.dsh /workspace
+
+# 设置环境变量
+ENV DSH_HOME=/home/node/.dsh
+ENV HOME=/workspace
+ENV TZ=Asia/Shanghai
+ENV DSH_PORT=3080
+
+USER node
+WORKDIR /workspace
+EXPOSE 3080
+
+# 构建期冒烟测试：确认 CLI 入口真的可执行
+RUN dsh --version
+
+# ⚠️ 顺序不能改：--patch 必须紧跟 "web"，写在 --no-open 之后会被当成未知参数。
+CMD ["dsh", "web", "--patch", "/etc/dsh/webserver.patch.yml", "--no-open"]
