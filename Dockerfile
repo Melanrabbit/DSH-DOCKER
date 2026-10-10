@@ -25,9 +25,14 @@ FROM node:24-trixie-slim
 # 安装运行时需要的工具（面向 coding agent 的常用命令）
 # 注意：不需要装系统 ripgrep —— dsh 的搜索工具用的是 npm 包里自带的 rg
 # （@vscode/ripgrep + 平台专属包，二进制直接打在 tarball 里，不依赖 postinstall）。
+#
+# gosu + passwd 是给入口脚本用的：gosu 负责降权（不像 su/sudo 那样引入 TTY 和
+# 信号转发问题），passwd 提供 usermod/groupmod —— 用来把 node 用户的 uid/gid
+# 改成 PUID/PGID。两者体积都很小，gosu 在 Debian trixie 是官方包（1.17-3）。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates \
       jq less unzip zip file xz-utils procps rsync openssh-client \
+      gosu passwd \
  && rm -rf /var/lib/apt/lists/*
 
 # 从构建阶段复制编译好的全局 node_modules
@@ -169,12 +174,36 @@ ENV HOME=/workspace
 ENV TZ=Asia/Shanghai
 ENV DSH_PORT=3080
 
-USER node
+# ── 运行身份：PUID / PGID ────────────────────────────────────────────────
+# 一句话：镜像里 node 用户是 uid/gid 1000，而 NAS 上的共享目录常属于别的 uid
+# （飞牛 fnOS 是 1001，权限 0700，连父目录 /vol2/1001 都是 000）。uid 不匹配时
+# 容器对那些挂载点连 opendir 都会 EACCES —— 表现就是「只能读不能写」甚至
+# 「全部拒绝」。入口脚本以 root 起，把 node 的 uid/gid 改成 PUID/PGID、
+# 把 DSH_HOME 与工作区 chown 过去，再用 gosu 降权启动 dsh。这样容器建出来的
+# 文件属主就是你在 fnOS 里的那个用户，文件管理器能正常改/删。
+#
+#   stat -c '%u:%g' /vol2/1001/DOCUMENTS    # 先查挂载目录的属主
+#   PUID=1001  PGID=1001                    # 填进 compose 的 environment
+#
+# 默认 1000:1000 —— 不设时行为与旧镜像完全一致。
+ENV PUID=1000
+ENV PGID=1000
+
+COPY dsh-entrypoint.sh /usr/local/bin/dsh-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/dsh-entrypoint.sh \
+ && sh -n /usr/local/bin/dsh-entrypoint.sh \
+ && gosu node true \
+ && echo "PUID/PGID entrypoint ok, node = $(gosu node id -u):$(gosu node id -g)"
+
 WORKDIR /workspace
 EXPOSE 3080
 
 # 构建期冒烟测试：确认 CLI 入口真的可执行
 RUN dsh --version
+
+# ⚠️ 这里不能再写 `USER node`：入口脚本需要 root 才能 usermod/chown，
+#    它会自己用 gosu 降权到 node。写死 USER node 会让 PUID/PGID 彻底失效。
+ENTRYPOINT ["/usr/local/bin/dsh-entrypoint.sh"]
 
 # ⚠️ 顺序不能改：--patch 必须紧跟 "web"，写在 --no-open 之后会被当成未知参数。
 CMD ["dsh", "web", "--patch", "/etc/dsh/webserver.patch.yml", "--no-open"]
