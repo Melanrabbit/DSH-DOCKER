@@ -63,6 +63,51 @@ fnOS 文件管理器里能正常查看 / 修改 / 删除。
 
 ---
 
+## 为什么老是要贴那个 `?token=`
+
+dsh 的浏览器认证分两层，搞清楚就不烦了：
+
+| | 是什么 | 有效多久 |
+| --- | --- | --- |
+| **启动 token** | 进程内随机生成，启动日志里那条 `http://…/?token=…` | **只用于首次登录**，每次重启都换（换是正常的） |
+| **登录 cookie** | 用 `?token=` 换来的 `dsh-auth-…` cookie，HttpOnly，签名密钥持久化在 `DSH_HOME/.credentials.yaml` | 上游默认 **30 天**，本镜像默认改成 **365 天** |
+
+所以：
+
+- **重启容器不需要重新贴 token**（密钥在卷里，cookie 依然有效）—— 如果你每次都要重贴，八成是下面第 2 条。
+- **cookie 是按 `host:port` 绑定并命名的**（`cookieName = dsh-auth-<sha256(authority)>`，这个 authority 还写进了签名载荷）。所以在 `192.168.110.110:3080`、`localhost:3080`、反代域名/端口之间来回换，每次都等于换了一份 cookie，就得重贴 token。**固定收藏一个地址**。
+- 有效期到了要重贴一次，想更久就调大（单位：天）：
+
+```yaml
+    environment:
+      - DSH_COOKIE_MAX_AGE_DAYS=3650     # 10 年，基本等于不用再贴
+```
+
+> ⚠️ 这个 token 是本镜像的**安全底线**：dsh 能执行任意命令、读写你挂进来的目录，拦截就靠它。别为了省事把端口暴露到公网，也别去绕开它。
+
+---
+
+## 镜像更新后，我这边怎么知道 / 怎么更新
+
+**Docker 不会自动发现 `latest` 变了** —— `latest` 只是个标签名，本地不 `docker pull` 就一直是旧的那份。
+
+现行流程：GitHub Actions 每天 03:00（北京时间）自动构建并推送 `latest` + `:<dsh版本>`。要更新就：
+
+1. 在飞牛 Docker 界面里**重新拉取** `ghcr.io/melanrabbit/dsh-docker:latest`，然后**重建容器**；
+2. 或者命令行 `docker compose pull && docker compose up -d`。
+
+什么时候值得更新：
+
+| 信号 | 说明 |
+| --- | --- |
+| `:<dsh版本>` 标签变了 | dsh 上游发新版了，通常值得跟 |
+| 仓库有新 commit | 镜像自身的修复（比如这次的 PUID/PGID），**`latest` 会变但版本号不变**，光看版本号看不出来 |
+| 仅仅「Actions 又跑了一次」 | **不代表有变化**。定时任务每天都构建，即使代码和 dsh 版本都没动 |
+
+想省事可以在 NAS 上跑一个 [Watchtower](https://github.com/containrrr/watchtower)，定时检查并自动 pull + 重建带指定 label 的容器。代价是镜像一旦有问题你也不知道，建议配合仓库的 Actions 页面一起看。
+
+---
+
 ## 这个镜像修了什么
 
 1. **断链的 `dsh` 命令** —— 上游软链指向不存在的 `bin/dsh.js`，会让容器陷入重启循环（`Cannot find module '/workspace/dsh'`）。改为从 `package.json` 的 `bin` 字段解析真实入口，并在构建期校验。

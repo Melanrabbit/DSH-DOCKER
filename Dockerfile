@@ -93,6 +93,9 @@ RUN set -eu; \
 #
 #   DSH_PORT           监听端口，默认 3080
 #   DSH_TRUSTED_HOSTS  额外可信地址，逗号分隔；用 host 网络时不需要
+#   DSH_COOKIE_MAX_AGE_DAYS
+#                      浏览器登录 cookie 的有效期（天），默认 365（上游默认只有 30）。
+#                      见下面 cookieMaxAgeDays 的说明。
 RUN mkdir -p /etc/dsh \
  && printf '%s\n' \
       '# 绑定所有网卡，等价于原来的 --host 0.0.0.0，但走官方支持的配置层' \
@@ -104,6 +107,10 @@ RUN mkdir -p /etc/dsh \
       '- id: connection' \
       '  config:' \
       "    trustedHosts: !!js (process.env.DSH_TRUSTED_HOSTS ?? '').split(',').map((s) => s.trim()).filter(Boolean).concat(ctx.webRuntime.trustedHosts)" \
+      '# 登录 cookie 有效期（上游 schema 默认 30 天，到期就得重新贴一次启动 token）。' \
+      '# 注意 cookie 是按「host:port」签名并命名的：换地址访问就等于换了一份 cookie，' \
+      '# 所以固定用同一个地址（建议直接收藏 http://<NAS_IP>:<端口>/）。' \
+      '    cookieMaxAgeDays: !!js Number(process.env.DSH_COOKIE_MAX_AGE_DAYS ?? 365)' \
       > /etc/dsh/webserver.patch.yml \
  && mkdir -p /home/node/.dsh /workspace \
  && chown -R node:node /home/node/.dsh /workspace
@@ -173,6 +180,8 @@ ENV DSH_HOME=/home/node/.dsh
 ENV HOME=/workspace
 ENV TZ=Asia/Shanghai
 ENV DSH_PORT=3080
+# 浏览器登录 cookie 有效期（天），见 /etc/dsh/webserver.patch.yml 里的说明
+ENV DSH_COOKIE_MAX_AGE_DAYS=365
 
 # ── 运行身份：PUID / PGID ────────────────────────────────────────────────
 # 一句话：镜像里 node 用户是 uid/gid 1000，而 NAS 上的共享目录常属于别的 uid
