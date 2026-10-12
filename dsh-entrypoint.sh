@@ -74,5 +74,48 @@ for DIR in /home/node/.dsh /workspace; do
   fi
 done
 
+# ── 可选：关掉 dsh 自带的浏览器 token 认证 ───────────────────────────────────
+# 打开 DSH_DISABLE_AUTH=1 后，isAuthenticated() 直接返回 true，访问 WebUI 不再
+# 需要启动日志里那条又长又难记的 ?token=。这正是飞牛 fnOS 打包版的做法
+# （它的源码里就是 `return true; /* fnos-fpk: browser token auth off */`）。
+#
+# ⚠️ 关掉之后，/api 上就只剩 Host/Origin 信任围栏了，而那个是**防 DNS
+#    rebinding / CSRF 的，不是认证** —— 任何人只要能把 Host 头写成你白名单里的
+#    值就能进来。所以只在下面两种情况用：
+#      * 端口不对外（只有内网 / 只有你能连到的网络）；
+#      * 前面有反向代理做真正的认证，且 dsh 端口没有被直接暴露。
+#    绝对不要「关掉认证」+「直接把 3080 映射到公网」。
+#
+# 默认不开。补丁是幂等的，容器重建后新文件会被重新打一次。
+if [ "${DSH_DISABLE_AUTH:-0}" = "1" ]; then
+  PATCHED=0
+  for F in $(find /usr/local/lib/node_modules -path '*/@deepseek-ai/dsh-client-connection/lib/index.js'); do
+    DSH_AUTH_TARGET="$F" node -e '
+      const fs = require("fs");
+      const p = process.env.DSH_AUTH_TARGET;
+      let s = fs.readFileSync(p, "utf8");
+      if (s.indexOf("dsh-docker: auth off") >= 0) { console.log("auth 已是关闭状态"); process.exit(0); }
+      const re = /(isAuthenticated\s*\(\s*request\s*\)\s*\{)/;
+      if (!re.test(s)) {
+        console.error("ERROR: 没找到 isAuthenticated(request)，上游代码结构变了，补丁未生效");
+        process.exit(1);
+      }
+      s = s.replace(re, "$1 return true; /* dsh-docker: auth off */");
+      if (!/isAuthenticated\s*\(\s*request\s*\)\s*\{\s*return true;/.test(s)) {
+        console.error("ERROR: 补丁写入后校验失败");
+        process.exit(1);
+      }
+      fs.writeFileSync(p, s);
+      console.log("已关闭浏览器认证: " + p);
+    ' || exit 1
+    PATCHED=1
+  done
+  if [ "$PATCHED" -ne 1 ]; then
+    log "ERROR: DSH_DISABLE_AUTH=1 但没找到 dsh-client-connection/lib/index.js"
+    exit 1
+  fi
+  log "警告：已关闭 dsh 浏览器认证，请确保本端口不对外暴露（仅内网 / 仅在反代之后）"
+fi
+
 log "以 node（$(id -u node):$(id -g node)）启动：$*"
 exec gosu node "$@"

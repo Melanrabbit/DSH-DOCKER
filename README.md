@@ -87,6 +87,41 @@ dsh 的浏览器认证分两层，搞清楚就不烦了：
 
 ---
 
+## 不想要 token？`DSH_DISABLE_AUTH=1`
+
+```yaml
+    environment:
+      - DSH_DISABLE_AUTH=1
+```
+
+打开后 dsh 自带的浏览器 token 认证会被关掉（`isAuthenticated()` 直接返回 `true`），访问 WebUI 再也不用贴那串 token —— 这正是**飞牛 fnOS 打包版的做法**，它的源码里就写着：
+
+```js
+isAuthenticated(request) {
+    return true; /* fnos-fpk: browser token auth off, host/origin trust fence is the gate */
+```
+
+补丁由入口脚本在启动时打在 `dsh-client-connection/lib/index.js` 上，**幂等**；如果上游代码结构变了，会**明确报错并拒绝启动**，不会静默失效变成"以为关了其实没关"。
+
+### ⚠️ 关掉认证到底意味着什么
+
+关掉之后，`/api` 上**只剩 Host/Origin 信任围栏**，而它只是防 DNS rebinding / CSRF 的：
+
+```js
+if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts)) return false;
+```
+
+**它不是认证。** 任何人只要能连到这个端口，并把 `Host` 头写成你白名单里的值，就能直接进来。所以：
+
+| ✅ 可以这么用 | ❌ 绝对不能这么用 |
+| --- | --- |
+| 只有内网能连（家里局域网 / 本机） | 3080 直接映射到公网 |
+| 前面有反代做真正的认证，**且 dsh 端口没有被直接暴露** | 反代做了认证，但 3080 还 publish 在外面 —— 等于留了一扇后门，那层认证形同虚设 |
+
+> **以后要做公网访问时的正确顺序**：① 先删掉 compose 里的 `ports: 3080:3080`，让 dsh 只和反代在同一个 docker 内网里；② 只 publish 反代；③ 在反代上做认证（Authelia/Authentik + 2FA，或至少 Caddy basic auth）+ HTTPS + WebSocket 转发 + 限速。
+
+---
+
 ## 镜像更新后，我这边怎么知道 / 怎么更新
 
 **Docker 不会自动发现 `latest` 变了** —— `latest` 只是个标签名，本地不 `docker pull` 就一直是旧的那份。
@@ -115,5 +150,7 @@ dsh 的浏览器认证分两层，搞清楚就不烦了：
 3. **`--host 0.0.0.0` 被拒 + 桥接网络下 `/api` 403** —— 监听地址与可信 Host 改由 `--patch` 覆盖层提供（`DSH_TRUSTED_HOSTS`）。
 4. **明文 http 下 `crypto.randomUUID` 缺失** —— 注入兼容代码，修掉「设置 → 账户」卡片导致的设置面板白屏。
 5. **运行身份** —— `PUID`/`PGID` 支持，见上一节。
+6. **登录 cookie 有效期** —— 上游默认 30 天，本镜像默认 365 天（`DSH_COOKIE_MAX_AGE_DAYS`）。
+7. **可选免 token 登录** —— `DSH_DISABLE_AUTH=1`，对齐飞牛 fnOS 的做法；**默认不开**，且打开后必须确保端口不对外。
 
 另外镜像内预装了 `pnpm`（GUI 的「添加插件」依赖它）以及常见 CLI 工具（git / jq / rsync / unzip / openssh-client 等）。
