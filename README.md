@@ -1,7 +1,14 @@
 # DSH-DOCKER
 服务器自动化DSH服务
 
-镜像：`ghcr.io/melanrabbit/dsh-docker:latest`（GitHub Actions 每天 03:00 北京时间自动重建）
+镜像（同一份镜像双推两个仓库，内容一致）：
+
+| 仓库 | 地址 | 用途 |
+|---|---|---|
+| GitHub Container Registry | `ghcr.io/melanrabbit/dsh-docker:latest` | 原有通道 |
+| Docker Hub | `melanrabbit/dsh-docker:latest` | **飞牛 fnOS 的「有新版本」检测只认 docker.io**，用这个才会提示更新 |
+
+GitHub Actions 每天 03:00 北京时间自动重建（另可手动触发）。
 
 > 跟随的是 npm 上的 **`next`** 这个 dist-tag：官方的预发布版本都发在 `next`，`latest` 反而落后一步（2026-10：`latest=0.2.0-rc.2`、`next=0.2.1-rc.2`）。想换回别的通道，手动触发 workflow 时填 `channel`＝`latest` / `next` / `alpha`。
 
@@ -26,7 +33,7 @@ stat -c '%u:%g' /vol2/1001/DOCUMENTS
 ```yaml
 services:
   dsh:
-    image: ghcr.io/melanrabbit/dsh-docker:latest
+    image: melanrabbit/dsh-docker:latest   # 或 ghcr.io/melanrabbit/dsh-docker:latest
     container_name: deepseek-harness
     restart: unless-stopped
     ports:
@@ -129,10 +136,12 @@ if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, truste
 
 **Docker 不会自动发现 `latest` 变了**：`latest` 只是个标签名，本地不 `docker pull` 就一直是旧的那份。
 
-现行流程：GitHub Actions 每天 03:00（北京时间）自动构建并推送 `latest` + `:<dsh版本>`，build 绿了之后还会**把镜像真跑起来验收**（默认模式应回 401、`DSH_DISABLE_AUTH=1` 应回 200、伪造 Host 应被围栏挡成 403），三项都过才算成功。要更新就：
+现行流程：GitHub Actions 每天 03:00（北京时间）自动构建并推送 `latest` + `:<dsh版本>`（GHCR 与 Docker Hub 同时推），build 绿了之后还会**把镜像真跑起来验收**（默认模式应回 401、`DSH_DISABLE_AUTH=1` 应回 200、伪造 Host 应被围栏挡成 403），三项都过才算成功。要更新就：
 
-1. 在飞牛 Docker 界面里**重新拉取** `ghcr.io/melanrabbit/dsh-docker:latest`，然后**重建容器**；
-2. 或者命令行 `docker compose pull && docker compose up -d`。
+1. 容器用 Docker Hub 镜像时（`melanrabbit/dsh-docker:latest`），飞牛 Docker 界面会自己标出**「有新版本」**，点更新即可；GHCR 镜像**不会有这个提示**（实测：飞牛的更新检测只覆盖 docker.io，ghcr.io 一律查不到），只能手动重新拉取 `ghcr.io/melanrabbit/dsh-docker:latest`；
+2. 两种都用命令行时：`docker compose pull && docker compose up -d`。
+
+> 换镜像仓库要改 compose 的 `image:` 那一行并**重建容器**（重建 = 容器内 dsh 重启一次，会话会断一下，数据都在卷里）。
 
 什么时候值得更新：
 
