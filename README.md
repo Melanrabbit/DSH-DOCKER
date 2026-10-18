@@ -1,7 +1,9 @@
 # DSH-DOCKER
 服务器自动化DSH服务
 
-镜像：`ghcr.io/melanrabbit/dsh-docker:latest`（GitHub Actions 每天 03:00 北京时间自动跟随 npm 上的 dsh 版本重建）
+镜像：`ghcr.io/melanrabbit/dsh-docker:latest`（GitHub Actions 每天 03:00 北京时间自动重建）
+
+> 跟随的是 npm 上的 **`next`** 这个 dist-tag：官方的预发布版本都发在 `next`，`latest` 反而落后一步（2026-10：`latest=0.2.0-rc.2`、`next=0.2.1-rc.2`）。想换回别的通道，手动触发 workflow 时填 `channel`＝`latest` / `next` / `alpha`。
 
 ---
 
@@ -9,7 +11,7 @@
 
 镜像里的 `node` 用户是 **uid/gid 1000**，而 NAS 上的共享目录通常属于别的用户
 （飞牛 fnOS 是 **1001**，权限 `0700`，连父目录 `/vol2/1001` 都是 `d---------`）。
-uid 对不上时，容器对这些挂载点**连目录都进不去** —— 报错看着像「只能读、不能写」，
+uid 对不上时，容器对这些挂载点**连目录都进不去**：报错看着像「只能读、不能写」，
 其实读写全被拒。
 
 先查目录属主：
@@ -60,6 +62,7 @@ fnOS 文件管理器里能正常查看 / 修改 / 删除。
 | **别用 `user:`** | compose 的 `user:` 会让容器以非 root 启动，入口脚本就没权限 usermod/chown，`PUID`/`PGID` 会静默失效。要改身份**只用 `PUID`/`PGID`** |
 | **想整容器跑 root** | 覆盖 entrypoint：`entrypoint: ["dsh", "web", "--patch", "/etc/dsh/webserver.patch.yml", "--no-open"]`。但这样建出来的文件属主是 root，fnOS 里改不动，不推荐 |
 | **不需要 `SHELL`** | 入口脚本走 usermod，容器内存在 uid=1001 的 passwd 条目，所以 `os.userInfo()` 不会抛异常（`dsh-subprocess-local` 里那处未加保护的调用是安全的） |
+| **绑定地址** | dsh 从 0.2.1 起不再接受 `0.0.0.0`（等于把可执行任意命令的面板挂到所有网卡上），只收某个本机网卡的具体 IP。入口脚本会自动挑「默认路由那张网卡」的 IP 来绑（桥接网络下 docker 正是把端口转发到这个地址），一般不用管。要固定就设 `DSH_HOST=<容器内的本机地址>`。⚠️ 填 NAS 的局域网 IP 是**错的**（那个地址不在容器网卡上，会绑不上）|
 
 ---
 
@@ -74,7 +77,7 @@ dsh 的浏览器认证分两层，搞清楚就不烦了：
 
 所以：
 
-- **重启容器不需要重新贴 token**（密钥在卷里，cookie 依然有效）—— 如果你每次都要重贴，八成是下面第 2 条。
+- **重启容器不需要重新贴 token**（密钥在卷里，cookie 依然有效），如果你每次都要重贴，八成是下面第 2 条。
 - **cookie 是按 `host:port` 绑定并命名的**（`cookieName = dsh-auth-<sha256(authority)>`，这个 authority 还写进了签名载荷）。所以在 `192.168.110.110:3080`、`localhost:3080`、反代域名/端口之间来回换，每次都等于换了一份 cookie，就得重贴 token。**固定收藏一个地址**。
 - 有效期到了要重贴一次，想更久就调大（单位：天）：
 
@@ -94,7 +97,7 @@ dsh 的浏览器认证分两层，搞清楚就不烦了：
       - DSH_DISABLE_AUTH=1
 ```
 
-打开后 dsh 自带的浏览器 token 认证会被关掉（`isAuthenticated()` 直接返回 `true`），访问 WebUI 再也不用贴那串 token —— 这正是**飞牛 fnOS 打包版的做法**，它的源码里就写着：
+打开后 dsh 自带的浏览器 token 认证会被关掉（`isAuthenticated()` 直接返回 `true`），访问 WebUI 再也不用贴那串 token，这正是**飞牛 fnOS 打包版的做法**，它的源码里就写着：
 
 ```js
 isAuthenticated(request) {
@@ -116,7 +119,7 @@ if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, truste
 | ✅ 可以这么用 | ❌ 绝对不能这么用 |
 | --- | --- |
 | 只有内网能连（家里局域网 / 本机） | 3080 直接映射到公网 |
-| 前面有反代做真正的认证，**且 dsh 端口没有被直接暴露** | 反代做了认证，但 3080 还 publish 在外面 —— 等于留了一扇后门，那层认证形同虚设 |
+| 前面有反代做真正的认证，**且 dsh 端口没有被直接暴露** | 反代做了认证，但 3080 还 publish 在外面，等于留了一扇后门，那层认证形同虚设 |
 
 > **以后要做公网访问时的正确顺序**：① 先删掉 compose 里的 `ports: 3080:3080`，让 dsh 只和反代在同一个 docker 内网里；② 只 publish 反代；③ 在反代上做认证（Authelia/Authentik + 2FA，或至少 Caddy basic auth）+ HTTPS + WebSocket 转发 + 限速。
 
@@ -124,9 +127,9 @@ if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, truste
 
 ## 镜像更新后，我这边怎么知道 / 怎么更新
 
-**Docker 不会自动发现 `latest` 变了** —— `latest` 只是个标签名，本地不 `docker pull` 就一直是旧的那份。
+**Docker 不会自动发现 `latest` 变了**：`latest` 只是个标签名，本地不 `docker pull` 就一直是旧的那份。
 
-现行流程：GitHub Actions 每天 03:00（北京时间）自动构建并推送 `latest` + `:<dsh版本>`。要更新就：
+现行流程：GitHub Actions 每天 03:00（北京时间）自动构建并推送 `latest` + `:<dsh版本>`，build 绿了之后还会**把镜像真跑起来验收**（默认模式应回 401、`DSH_DISABLE_AUTH=1` 应回 200、伪造 Host 应被围栏挡成 403），三项都过才算成功。要更新就：
 
 1. 在飞牛 Docker 界面里**重新拉取** `ghcr.io/melanrabbit/dsh-docker:latest`，然后**重建容器**；
 2. 或者命令行 `docker compose pull && docker compose up -d`。
@@ -137,7 +140,7 @@ if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, truste
 | --- | --- |
 | `:<dsh版本>` 标签变了 | dsh 上游发新版了，通常值得跟 |
 | 仓库有新 commit | 镜像自身的修复（比如这次的 PUID/PGID），**`latest` 会变但版本号不变**，光看版本号看不出来 |
-| 仅仅「Actions 又跑了一次」 | **不代表有变化**。定时任务每天都构建，即使代码和 dsh 版本都没动 |
+| 仅仅「Actions 又跑了一次」 | **不代表有新内容**。定时任务每天都构建，但 dsh 版本与 Dockerfile 都没变时，构建出来的镜像内容其实是一样的（只是 `latest` 又被覆盖了一次）|
 
 想省事可以在 NAS 上跑一个 [Watchtower](https://github.com/containrrr/watchtower)，定时检查并自动 pull + 重建带指定 label 的容器。代价是镜像一旦有问题你也不知道，建议配合仓库的 Actions 页面一起看。
 
@@ -145,12 +148,13 @@ if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, truste
 
 ## 这个镜像修了什么
 
-1. **断链的 `dsh` 命令** —— 上游软链指向不存在的 `bin/dsh.js`，会让容器陷入重启循环（`Cannot find module '/workspace/dsh'`）。改为从 `package.json` 的 `bin` 字段解析真实入口，并在构建期校验。
-2. **设置页不可用 / 白屏** —— 上游按 `ctx.remote.$host.isLoopback` 决定设置持久化，用局域网 IP 访问时退化成浏览器内存态。这里对齐飞牛 fnOS 打包版的做法，固定为 `"host"`。
-3. **`--host 0.0.0.0` 被拒 + 桥接网络下 `/api` 403** —— 监听地址与可信 Host 改由 `--patch` 覆盖层提供（`DSH_TRUSTED_HOSTS`）。
-4. **明文 http 下 `crypto.randomUUID` 缺失** —— 注入兼容代码，修掉「设置 → 账户」卡片导致的设置面板白屏。
-5. **运行身份** —— `PUID`/`PGID` 支持，见上一节。
-6. **登录 cookie 有效期** —— 上游默认 30 天，本镜像默认 365 天（`DSH_COOKIE_MAX_AGE_DAYS`）。
-7. **可选免 token 登录** —— `DSH_DISABLE_AUTH=1`，对齐飞牛 fnOS 的做法；**默认不开**，且打开后必须确保端口不对外。
+1. **断链的 `dsh` 命令**：上游软链指向不存在的 `bin/dsh.js`，会让容器陷入重启循环（`Cannot find module '/workspace/dsh'`）。改为从 `package.json` 的 `bin` 字段解析真实入口，并在构建期校验。
+2. **监听地址 + 桥接网络下 `/api` 403**：绑定地址与可信 Host 由 `--patch` 覆盖层提供（`DSH_HOST` / `DSH_PORT` / `DSH_TRUSTED_HOSTS`）。dsh 0.2.1 起只收「具体本机 IP」，写 `0.0.0.0` 会让容器根本起不来，所以地址改由入口脚本探测容器网卡后注入。
+3. **明文 http 下 `crypto.randomUUID` 缺失**：注入页面级兼容代码。0.2.1 的前端自己已经不用它了，但第三方**客户端插件**还在用（本机装的 dsh-im、commandcode provider 的 `client.js` 里就有），这段兜底挂在 `index.html` 上，对后装的插件一样生效，所以保留。
+4. **运行身份**：`PUID`/`PGID` 支持，见上一节。
+5. **登录 cookie 有效期**：上游默认 30 天，本镜像默认 365 天（`DSH_COOKIE_MAX_AGE_DAYS`）。
+6. **可选免 token 登录**：`DSH_DISABLE_AUTH=1`，对齐飞牛 fnOS 的做法；**默认不开**，且打开后必须确保端口不对外。0.2.1 起这个补丁要同时打 `isAuthenticated` 与 `authenticateApi` 两处，只打一处的老写法会让容器直接拒绝启动。
 
 另外镜像内预装了 `pnpm`（GUI 的「添加插件」依赖它）以及常见 CLI 工具（git / jq / rsync / unzip / openssh-client 等）。
+
+> 顺带删掉了旧镜像里「设置页持久化（`isLoopback ? "host" : "memory"`）」那条补丁：那段机制上游已经整个移除，`sed` 匹配不到会让后面的 `grep -q` 校验失败，构建直接挂掉。

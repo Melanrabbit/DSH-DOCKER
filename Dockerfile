@@ -50,47 +50,30 @@ RUN BIN="$(node -p "require('/usr/local/lib/node_modules/@deepseek-ai/dsh/packag
  && test -f "$(readlink -f /usr/local/bin/dsh)" \
  && echo "dsh entrypoint -> $(readlink -f /usr/local/bin/dsh)"
 
-# ── 修复 2：设置页在非回环地址下不可用（对齐飞牛 fnOS 打包版的做法）──────
-# 上游设计：设置页的持久化按「浏览器地址栏的主机名」决定 ——
-#   const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";
-# 用局域网 IP（例如 http://192.168.110.110:3080）打开时 isLoopback 为 false，
-# 设置页退化成浏览器内存态，报 "settings are unavailable in this browser"，
-# 连读取设置的请求都不发，于是「设置 → 模型」等页面完全不可用。
-# 飞牛的 fnOS 打包版正是把这一行改成常量 "host"（已逐字节对比确认），
-# 所以它的原生实例用局域网 IP 也能进设置页。这里照抄同样的最小改动。
+# ── 修复 2：监听地址只走配置层 + 桥接网络下的可信 Host（0.2.1 起变了）────
+# 为什么不能用 --host 0.0.0.0：CLI 会直接拒绝通配地址并以退出码 1 退出。
 #
-# 安全说明：设置文档即 profile 的 patch 文件，能挂载任意插件（≈ 代码执行），
-# 上游把设置页限制在回环地址就是为了挡住这条路。本镜像的兜底是启动 token +
-# Host/Origin 信任围栏（DSH_TRUSTED_HOSTS），请勿再把端口暴露到公网。
-# 注：路径不能硬编码。`npm install -g` 会把依赖装进包自己的 node_modules
-# （/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/...），而本地
-# 非全局安装是扁平的（.../node_modules/@deepseek-ai/dsh-client-ui-settings），
-# 所以这里用 find 定位；找不到就打印实际位置并让构建失败。
-RUN set -eu; \
-    FOUND=0; \
-    for f in $(find /usr/local/lib/node_modules -path '*/@deepseek-ai/dsh-client-ui-settings/lib/client.js'); do \
-      echo "settings client bundle: $f"; \
-      sed -i 's/ctx\.remote\.\$host\.isLoopback ? "host" : "memory"/"host"/' "$f"; \
-      grep -q 'const persistence = "host";' "$f"; \
-      FOUND=1; \
-    done; \
-    if [ "$FOUND" -ne 1 ]; then \
-      echo "ERROR: 没找到 dsh-client-ui-settings/lib/client.js，实际安装位置如下："; \
-      find /usr/local/lib/node_modules -name 'client.js' -path '*dsh-client-ui-settings*'; \
-      exit 1; \
-    fi; \
-    echo "client-ui-settings: persistence pinned to host (fnOS parity)"
-
-# ── 修复 3：被 CLI 拒绝的 --host 0.0.0.0，以及桥接网络下的 /api 403 ──────
-# dsh 0.2.0-rc.2 会直接拒绝 --host 0.0.0.0（"intentionally not supported yet
-# for safety"）并以退出码 1 退出。绑定地址改由 patch 层提供：webserver 行的
-# schema 允许 "127.0.0.1" / "0.0.0.0" 两个字面量。
+# 为什么也不能在 patch 里写 0.0.0.0：
+#   * 0.2.0-rc.2 的 webserver schema 是 z.union(["127.0.0.1", "0.0.0.0"]），能写；
+#   * 0.2.1-rc.2 改成「必须是某个本机网卡的具体 IP 字面量」，通配地址直接抛错
+#     （webserver: host "0.0.0.0" is an unspecified (wildcard) address ...），
+#     配置校验不过 → 容器根本起不来（实测确认）。
+# 所以绑定地址改成读环境变量 DSH_HOST：入口脚本在容器里按默认路由挑出那张网卡的
+# IPv4（桥接网络下 docker 正是把 3080 转发到这个地址）再导出；想自己指定就在
+# compose 里设 DSH_HOST=<容器内的本机地址> 覆盖。
 #
 # 放在 /etc/dsh（而不是 $DSH_HOME）是为了不被挂载卷遮住。
 # 另外补一条 connection 行：把环境变量 DSH_TRUSTED_HOSTS 里的地址追加进
 # 可信 Host 列表 —— 用桥接网络 + 端口映射时，容器看到的网卡 IP 是 172.x，
 # 宿主机 IP 不在自动派生出来的列表里，不加这个所有 /api 都会 403。
+# 0.2.1 把 webRuntime 这个服务删了（相关派生逻辑并入 webStartup），旧表达式
+# `ctx.webRuntime.trustedHosts` 会让 connection 以 "cannot get property
+# webRuntime without inject" 起不来（实测确认）；这里改用不抛异常的 ctx.get()。
 #
+# 上游 bundle 的 webserver 行还有 tls / compression 几项，而 patch 是整段替换
+# config，所以这里照抄一份，否则会被打回 schema 默认值（丢掉 gzip 压缩）。
+#
+#   DSH_HOST           绑定地址，容器内的本机 IP；不设则由入口脚本探测
 #   DSH_PORT           监听端口，默认 3080
 #   DSH_TRUSTED_HOSTS  额外可信地址，逗号分隔；用 host 网络时不需要
 #   DSH_COOKIE_MAX_AGE_DAYS
@@ -98,15 +81,19 @@ RUN set -eu; \
 #                      见下面 cookieMaxAgeDays 的说明。
 RUN mkdir -p /etc/dsh \
  && printf '%s\n' \
-      '# 绑定所有网卡，等价于原来的 --host 0.0.0.0，但走官方支持的配置层' \
+      '# 绑定一个具体的本机地址（0.2.1 起不再允许 0.0.0.0）' \
       '- id: webserver' \
       '  config:' \
-      "    host: '0.0.0.0'" \
-      '    port: !!js Number(process.env.DSH_PORT ?? 3080)' \
+      "    host: !!js process.env.DSH_HOST ?? ctx.get('webStartup')?.host ?? '127.0.0.1'" \
+      "    port: !!js Number(process.env.DSH_PORT ?? ctx.get('webStartup')?.port ?? 3080)" \
+      "    tls: !!js ctx.get('webStartup')?.tls" \
+      '    compression: gzip' \
+      '    compressionLevel: 1' \
+      '    compressionThresholdBytes: 1024' \
       '# 桥接网络部署时，把 DSH_TRUSTED_HOSTS 里声明的地址也加入可信 Host' \
       '- id: connection' \
       '  config:' \
-      "    trustedHosts: !!js (process.env.DSH_TRUSTED_HOSTS ?? '').split(',').map((s) => s.trim()).filter(Boolean).concat(ctx.webRuntime.trustedHosts)" \
+      "    trustedHosts: !!js (process.env.DSH_TRUSTED_HOSTS ?? '').split(',').map((s) => s.trim()).filter(Boolean).concat(ctx.get('webStartup')?.trustedHosts ?? [])" \
       '# 登录 cookie 有效期（上游 schema 默认 30 天，到期就得重新贴一次启动 token）。' \
       '# 注意 cookie 是按「host:port」签名并命名的：换地址访问就等于换了一份 cookie，' \
       '# 所以固定用同一个地址（建议直接收藏 http://<NAS_IP>:<端口>/）。' \
@@ -115,13 +102,17 @@ RUN mkdir -p /etc/dsh \
  && mkdir -p /home/node/.dsh /workspace \
  && chown -R node:node /home/node/.dsh /workspace
 
-# ── 修复 4：明文 http 下 crypto.randomUUID 缺失，导致设置页白屏 ──────────────
+# ── 修复 3：明文 http 下 crypto.randomUUID 缺失导致的页面白屏（继续保留）────
 # crypto.randomUUID 只在「安全上下文」（https / localhost / 127.0.0.1）存在。
-# 用 http://<局域网IP>:3080 访问时它不存在，「设置 → 账户」卡片一渲染就抛
+# 用 http://<局域网IP>:3080 访问时它不存在，0.2.0 的设置页一渲染就抛
 #   TypeError: crypto.randomUUID is not a function
-# 整个设置面板随之崩成白屏（浏览器控制台会看到 slot entry crashed in 'settings.section'）。
-# 飞牛的 fnOS 打包版正是往 index.html 注入了一段同样的兼容代码（已对比确认），
-# 所以原生实例用局域网 IP 访问设置页也正常。这里照抄同样的做法，区别是：
+# 整个面板随之崩成白屏（浏览器控制台会看到 slot entry crashed in 'settings.section'）。
+#
+# 已核实：0.2.1 的 dsh-web-frontend/dist 里 randomUUID 出现 0 次，但**第三方
+# 客户端插件还在用**（本机已装的 @xmanrui/dsh-im、@mars-sea/dsh-commandcode-
+# provider 的 client.js 里都有）。这段 shim 挂在 index.html 上，是页面级兜底，
+# 对任何后装的客户端插件都生效，而本机就是明文 http + 局域网访问，所以继续保留。
+# 飞牛的 fnOS 打包版也是往 index.html 注入同样的兼容代码（已对比确认），区别是：
 # 优先用 crypto.getRandomValues 生成真正的 v4 UUID，拿不到才退回 Math.random。
 # 注：navigator.clipboard 同样只在安全上下文存在，所以复制按钮在明文 http 下
 #     仍可能无效；要完全干净就用 https 反代，或 SSH 隧道从 127.0.0.1 访问。
@@ -207,8 +198,38 @@ RUN chmod 0755 /usr/local/bin/dsh-entrypoint.sh \
 WORKDIR /workspace
 EXPOSE 3080
 
-# 构建期冒烟测试：确认 CLI 入口真的可执行
+# 构建期冒烟测试 1：确认 CLI 入口真的可执行
 RUN dsh --version
+
+# 构建期冒烟测试 2：把 web 服务真起一遍，确认配置层能过、地址能绑上。
+# 只做 `dsh --version` 挡不住这类问题：0.2.1 把 webserver.host 的通配地址判死、
+# 又把 webRuntime 服务改名成 webStartup，配置校验一失败容器就根本起不来，
+# 而 build 依旧是绿的（0.2.0 → 0.2.1 升级时这两个坑都实测踩到了）。
+# 所以这里真的拉起服务，等到能 HTTP 应答才算过（认证开着时 / 回 401，因此不校验
+# 具体状态码，只要求「不是 000」= 端口上有东西在应答）。
+# 用一次性的 HOME/DSH_HOME，测完删掉，避免把 profile 骨架烤进镜像。
+RUN set -eu; \
+    rm -rf /tmp/dshhome; mkdir -p /tmp/dshhome; \
+    HOME=/tmp/dshhome DSH_HOME=/tmp/dshhome \
+      dsh web --patch /etc/dsh/webserver.patch.yml --no-open > /tmp/boot.log 2>&1 & \
+    BOOT_PID=$!; \
+    CODE=000; \
+    for i in $(seq 1 60); do \
+      CODE="$(curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Host: 127.0.0.1:3080' http://127.0.0.1:3080/ || true)"; \
+      [ "$CODE" != "000" ] && break; \
+      kill -0 "$BOOT_PID" 2>/dev/null || break; \
+      sleep 1; \
+    done; \
+    kill "$BOOT_PID" 2>/dev/null || true; \
+    wait "$BOOT_PID" 2>/dev/null || true; \
+    if [ "$CODE" = "000" ]; then \
+      echo "ERROR: 构建期启动冒烟测试失败（HTTP $CODE），日志如下："; \
+      cat /tmp/boot.log 2>/dev/null || true; \
+      find /tmp/dshhome/logs -name '*.log' -exec cat {} + 2>/dev/null || true; \
+      exit 1; \
+    fi; \
+    rm -rf /tmp/dshhome /tmp/boot.log; \
+    echo "构建期启动冒烟测试通过：HTTP $CODE"
 
 # ⚠️ 这里不能再写 `USER node`：入口脚本需要 root 才能 usermod/chown，
 #    它会自己用 gosu 降权到 node。写死 USER node 会让 PUID/PGID 彻底失效。

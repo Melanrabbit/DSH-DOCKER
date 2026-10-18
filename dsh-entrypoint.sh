@@ -74,10 +74,48 @@ for DIR in /home/node/.dsh /workspace; do
   fi
 done
 
+# ── 监听地址：0.2.1 起上游不再接受「绑所有网卡」──────────────────────────────
+# 0.2.0 还能在 patch 层写 host: '0.0.0.0'；0.2.1 的 webserver schema 会把通配地址
+# 直接判死（"is an unspecified (wildcard) address ..."）并让容器根本起不来，
+# 只接受「某个本机网卡的具体 IP」。桥接网络下 docker 把 3080 转发到容器自己的
+# eth0 地址，所以这里按默认路由挑出容器地址，交给 /etc/dsh/webserver.patch.yml
+# 里那条 !!js 读走（见 Dockerfile 修复 2）。
+# 想自己固定就设 DSH_HOST：必须是容器内部的本机地址，不是 NAS 的 IP。
+if [ -z "${DSH_HOST:-}" ]; then
+  DSH_HOST="$(node -e '
+    const os = require("os"), fs = require("fs");
+    const ifaces = os.networkInterfaces();
+    const ipv4 = (name) => ((ifaces[name] || []).find((i) => i.family === "IPv4" && !i.internal) || {}).address;
+    let name = "";
+    try {
+      for (const line of fs.readFileSync("/proc/net/route", "utf8").split("\n").slice(1)) {
+        const col = line.trim().split(/\s+/);
+        if (col[1] === "00000000" && col[7] === "00000000") { name = col[0]; break; }
+      }
+    } catch (e) {}
+    let addr = name ? ipv4(name) : "";
+    if (!addr) for (const key of Object.keys(ifaces)) { addr = ipv4(key); if (addr) break; }
+    process.stdout.write(addr || "");
+  ')"
+fi
+
+if [ -z "${DSH_HOST:-}" ]; then
+  log "ERROR: 探测不到可绑定的本机 IP。请在 compose 的 environment 里显式设置"
+  log "       DSH_HOST=<容器内的本机地址>（用 network_mode: host 时填宿主机 IP）"
+  exit 1
+fi
+export DSH_HOST
+log "监听地址：$DSH_HOST:${DSH_PORT:-3080}"
+
 # ── 可选：关掉 dsh 自带的浏览器 token 认证 ───────────────────────────────────
 # 打开 DSH_DISABLE_AUTH=1 后，isAuthenticated() 直接返回 true，访问 WebUI 不再
 # 需要启动日志里那条又长又难记的 ?token=。这正是飞牛 fnOS 打包版的做法
 # （它的源码里就是 `return true; /* fnos-fpk: browser token auth off */`）。
+#
+# 0.2.1 起这个补丁要打两处：签名多了 secure（isAuthenticated(request, secure)），
+# 而且 /api 还多了一层 authenticateApi()（它要求 cookie 载荷 version === 2，
+# 浏览器 cookie 是 version 1，所以对浏览器只会返回 undefined）。只打前者的话，
+# 走 authenticateApi 的路径依旧会被拒。
 #
 # ⚠️ 关掉之后，/api 上就只剩 Host/Origin 信任围栏了，而那个是**防 DNS
 #    rebinding / CSRF 的，不是认证** —— 任何人只要能把 Host 头写成你白名单里的
@@ -94,18 +132,33 @@ if [ "${DSH_DISABLE_AUTH:-0}" = "1" ]; then
       const fs = require("fs");
       const p = process.env.DSH_AUTH_TARGET;
       let s = fs.readFileSync(p, "utf8");
-      if (s.indexOf("dsh-docker: auth off") >= 0) { console.log("auth 已是关闭状态"); process.exit(0); }
-      const re = /(isAuthenticated\s*\(\s*request\s*\)\s*\{)/;
-      if (!re.test(s)) {
-        console.error("ERROR: 没找到 isAuthenticated(request)，上游代码结构变了，补丁未生效");
+      const MARK = "/* dsh-docker: auth off */";
+      // 0.2.0: isAuthenticated(request) { ... }
+      // 0.2.1: isAuthenticated(request, secure = false) 且 /api 还走 authenticateApi
+      // 两个正则都用 [^)]* 兼容两种签名，以后上游再加参数也不用改。
+      const reAuth = /(isAuthenticated\s*\(\s*request[^)]*\)\s*\{)/;
+      const reApi = /(authenticateApi\s*\(\s*request[^)]*\)\s*\{)/;
+      const doneAuth = /isAuthenticated\s*\(\s*request[^)]*\)\s*\{\s*return true;/;
+      const doneApi = /authenticateApi\s*\(\s*request[^)]*\)\s*\{\s*return "dsh-docker-auth-off";/;
+      if (!reAuth.test(s)) {
+        console.error("ERROR: 没找到 isAuthenticated(request...)，上游代码结构变了，补丁未生效");
         process.exit(1);
       }
-      s = s.replace(re, "$1 return true; /* dsh-docker: auth off */");
-      if (!/isAuthenticated\s*\(\s*request\s*\)\s*\{\s*return true;/.test(s)) {
-        console.error("ERROR: 补丁写入后校验失败");
-        process.exit(1);
-      }
+      // 幂等：各自独立判断，已经打好的一处不动，缺的那处补上（可自愈半成品状态）。
+      let changed = false;
+      if (!doneAuth.test(s)) { s = s.replace(reAuth, "$1 return true; " + MARK); changed = true; }
+      if (reApi.test(s) && !doneApi.test(s)) { s = s.replace(reApi, "$1 return \"dsh-docker-auth-off\"; " + MARK); changed = true; }
+      if (!changed) { console.log("auth 已是关闭状态"); process.exit(0); }
       fs.writeFileSync(p, s);
+      const out = fs.readFileSync(p, "utf8");
+      if (!doneAuth.test(out)) {
+        console.error("ERROR: isAuthenticated 写入后校验失败");
+        process.exit(1);
+      }
+      if (reApi.test(out) && !doneApi.test(out)) {
+        console.error("ERROR: authenticateApi 存在但写入后校验失败");
+        process.exit(1);
+      }
       console.log("已关闭浏览器认证: " + p);
     ' || exit 1
     PATCHED=1

@@ -2,8 +2,13 @@ name: Auto Build dsh Docker Image
 
 on:
   schedule:
-    - cron: '0 19 * * *' # 每天凌晨 3 点自动检查更新
-  workflow_dispatch:      # 允许手动触发
+    - cron: '0 19 * * *' # 每天北京时间 03:00 自动检查更新
+  workflow_dispatch: # 允许手动触发
+    inputs:
+      channel:
+        description: 'npm dist-tag：next（官方新版都在这）/ latest / alpha'
+        required: false
+        default: 'next'
 
 jobs:
   build-and-push:
@@ -11,22 +16,31 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      version: ${{ steps.dsh_version.outputs.version }}
+      image: ${{ steps.image.outputs.image }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Get latest dsh version from npm
+      # 关键：必须带 dist-tag 取版本。裸 `npm view @deepseek-ai/dsh version` 等价于
+      # @latest，而官方的预发布版本挂在 `next` 上（2026-10：latest=0.2.0-rc.2，
+      # next=0.2.1-rc.2），结果就是「每天都构建，但永远构建 0.2.0-rc.2」。
+      - name: Resolve dsh version
         id: dsh_version
         run: |
           npm config set registry https://registry.npmmirror.com
-          VERSION=$(npm view @deepseek-ai/dsh version)
-          echo "DSH_VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Latest dsh version is $VERSION"
+          CHANNEL="${{ github.event.inputs.channel || 'next' }}"
+          VERSION="$(npm view "@deepseek-ai/dsh@${CHANNEL}" version)"
+          test -n "$VERSION"
+          echo "channel=$CHANNEL -> dsh $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set lowercase image name
+        id: image
         run: |
-          echo "IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -41,7 +55,72 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ env.IMAGE_NAME }}:latest
-            ghcr.io/${{ env.IMAGE_NAME }}:${{ env.DSH_VERSION }}
+            ${{ steps.image.outputs.image }}:latest
+            ${{ steps.image.outputs.image }}:${{ steps.dsh_version.outputs.version }}
           build-args: |
-            DSH_VERSION=${{ env.DSH_VERSION }}
+            DSH_VERSION=${{ steps.dsh_version.outputs.version }}
+
+  # 构建绿了不等于镜像能跑：真正的验证是把镜像跑起来，看容器起没起、认证开关有没有
+  # 生效、Host 信任围栏有没有被误关。历史上正是「CI 全绿但一升级容器起不来」这类问题。
+  verify-image:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 默认模式：容器应起来且仍在要认证（预期 401）
+        run: |
+          set -eu
+          IMAGE="${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.version }}"
+          docker run -d --name dsh-default -p 13080:3080 -e PUID=1001 -e PGID=1001 "$IMAGE"
+          CODE=000
+          for i in $(seq 1 60); do
+            CODE="$(curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Host: 127.0.0.1:13080' http://127.0.0.1:13080/ || true)"
+            [ "$CODE" != "000" ] && break
+            docker ps --filter name=dsh-default --format '{{.Status}}' | grep -q Up || break
+            sleep 2
+          done
+          echo "默认模式 HTTP=$CODE"
+          if [ "$CODE" != "401" ]; then
+            echo "::error::预期 401（认证开着），实际 $CODE，容器日志如下"
+            docker logs dsh-default || true
+            exit 1
+          fi
+          docker rm -f dsh-default
+
+      - name: 关认证模式：应免 token（预期 200），且信任围栏仍在（伪造 Host 预期 403）
+        run: |
+          set -eu
+          IMAGE="${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.version }}"
+          docker run -d --name dsh-noauth -p 13081:3080 \
+            -e PUID=1001 -e PGID=1001 -e DSH_DISABLE_AUTH=1 -e DSH_TRUSTED_HOSTS=127.0.0.1 "$IMAGE"
+          CODE=000
+          for i in $(seq 1 60); do
+            CODE="$(curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Host: 127.0.0.1:13081' http://127.0.0.1:13081/ || true)"
+            [ "$CODE" != "000" ] && break
+            docker ps --filter name=dsh-noauth --format '{{.Status}}' | grep -q Up || break
+            sleep 2
+          done
+          echo "关认证模式 HTTP=$CODE"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::预期 200（免 token），实际 $CODE，容器日志如下"
+            docker logs dsh-noauth || true
+            exit 1
+          fi
+          BAD="$(curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Host: evil.example:13081' http://127.0.0.1:13081/ || true)"
+          echo "伪造 Host 的响应 HTTP=$BAD"
+          if [ "$BAD" != "403" ]; then
+            echo "::error::伪造 Host 本应被信任围栏挡成 403，实际 $BAD：认证关了但围栏也丢了"
+            docker logs dsh-noauth || true
+            exit 1
+          fi
+          docker rm -f dsh-noauth
