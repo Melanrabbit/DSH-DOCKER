@@ -17,9 +17,9 @@ jobs:
       contents: read
       packages: write
     outputs:
+      # 只传版本号：镜像名里含 DOCKERHUB_USERNAME（=melanrabbit）这个 secret 值，
+      # 一经登记为 secret，GitHub 就把整条 output 值抹空（详见 verify-image 上方注释）。
       version: ${{ steps.dsh_version.outputs.version }}
-      image: ${{ steps.image.outputs.ghcr }}
-      dockerhub_image: ${{ steps.image.outputs.dockerhub }}
 
     steps:
       - name: Checkout code
@@ -78,14 +78,38 @@ jobs:
 
   # 构建绿了不等于镜像能跑：真正的验证是把镜像跑起来，看容器起没起、认证开关有没有
   # 生效、Host 信任围栏有没有被误关。历史上正是「CI 全绿但一升级容器起不来」这类问题。
+  #
+  # 注意（2026-10-18 实测踩坑）：镜像名**不能**经 job outputs 传给本作业。
+  # DOCKERHUB_USERNAME=melanrabbit 一旦登记成 secret，GitHub 就把 outputs 里含该字符串的
+  # 整条值抹成空串（同一字符串在日志里显示为 ***），于是这里拿到 `:0.2.1-rc.2` 而不是
+  # `ghcr.io/...:0.2.1-rc.2`，docker 直接 "invalid reference format"。改为本作业内自己拼。
   verify-image:
     needs: build-and-push
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
+    env:
+      VERSION: ${{ needs.build-and-push.outputs.version }}
 
     steps:
+      - name: 组装镜像名（GHCR + Docker Hub）
+        run: |
+          set -eu
+          OWNER_L="$(echo '${{ github.repository }}' | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')"
+          NAME_L="$(echo '${{ github.repository }}' | cut -d/ -f2 | tr '[:upper:]' '[:lower:]')"
+          DH_USER_L="$(echo '${{ secrets.DOCKERHUB_USERNAME }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_GHCR=ghcr.io/$OWNER_L/$NAME_L:$VERSION" >> "$GITHUB_ENV"
+          echo "IMAGE_DH=docker.io/$DH_USER_L/$NAME_L:$VERSION" >> "$GITHUB_ENV"
+
+      - name: 镜像名自检（防 secret 抹值把名字吃掉）
+        run: |
+          set -eu
+          echo "GHCR      = $IMAGE_GHCR"
+          echo "Docker Hub= $IMAGE_DH"
+          case "$IMAGE_GHCR" in ghcr.io/*/*:*) ;; *) echo "::error::IMAGE_GHCR 组装失败：'$IMAGE_GHCR'"; exit 1 ;; esac
+          case "$IMAGE_DH" in docker.io/*/*:*) ;; *) echo "::error::IMAGE_DH 组装失败：'$IMAGE_DH'"; exit 1 ;; esac
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -93,10 +117,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 默认模式：容器应起来且仍在要认证（预期 401）
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 两个仓库都得有这个 tag（否则说明只推成功了一半）
         run: |
           set -eu
-          IMAGE="${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.version }}"
+          for REF in "$IMAGE_GHCR" "$IMAGE_DH"; do
+            docker manifest inspect "$REF" > /dev/null
+            echo "✓ $REF 存在"
+          done
+
+      - name: 默认模式：容器应起来且仍在要认证（预期 401）· 跑 Docker Hub 那份
+        run: |
+          set -eu
+          IMAGE="$IMAGE_DH"   # 飞牛 fnOS 拉的就是这一份，优先验收它
           docker run -d --name dsh-default -p 13080:3080 -e PUID=1001 -e PGID=1001 "$IMAGE"
           CODE=000
           for i in $(seq 1 60); do
@@ -113,10 +151,10 @@ jobs:
           fi
           docker rm -f dsh-default
 
-      - name: 关认证模式：应免 token（预期 200），且信任围栏仍在（伪造 Host 预期 403）
+      - name: 关认证模式：应免 token（预期 200），且信任围栏仍在（伪造 Host 预期 403）· 跑 GHCR 那份
         run: |
           set -eu
-          IMAGE="${{ needs.build-and-push.outputs.image }}:${{ needs.build-and-push.outputs.version }}"
+          IMAGE="$IMAGE_GHCR"
           docker run -d --name dsh-noauth -p 13081:3080 \
             -e PUID=1001 -e PGID=1001 -e DSH_DISABLE_AUTH=1 -e DSH_TRUSTED_HOSTS=127.0.0.1 "$IMAGE"
           CODE=000
