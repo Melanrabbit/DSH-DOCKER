@@ -116,10 +116,19 @@ jobs:
             docker logs dsh-noauth || true
             exit 1
           fi
-          BAD="$(curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Host: evil.example:13081' http://127.0.0.1:13081/ || true)"
-          echo "伪造 Host 的响应 HTTP=$BAD"
+          # 信任围栏只围 /api：页面外壳（/）不受 Host 围栏管，这是上游行为。
+          # 所以拿 /api 探测：伪造 Host 必须 403；可信 Host 打同一个地址不能也是
+          # 403（否则说明围栏把所有人都挡了，等于什么都没验证到）。
+          BAD="$(curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Host: evil.example:13081' http://127.0.0.1:13081/api/__fence_probe || true)"
+          GOOD="$(curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Host: 127.0.0.1:13081' http://127.0.0.1:13081/api/__fence_probe || true)"
+          echo "围栏探测：伪造 Host=$BAD  可信 Host=$GOOD"
           if [ "$BAD" != "403" ]; then
-            echo "::error::伪造 Host 本应被信任围栏挡成 403，实际 $BAD：认证关了但围栏也丢了"
+            echo "::error::伪造 Host 打 /api 本应被信任围栏挡成 403，实际 $BAD：认证关了但围栏也丢了"
+            docker logs dsh-noauth || true
+            exit 1
+          fi
+          if [ "$GOOD" = "403" ]; then
+            echo "::error::可信 Host 打 /api 也被挡成 403，围栏判定可疑（Host 白名单可能没生效）"
             docker logs dsh-noauth || true
             exit 1
           fi
